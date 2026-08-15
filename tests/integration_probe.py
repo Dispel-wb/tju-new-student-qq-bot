@@ -7,7 +7,8 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_DIR))
+SOURCE_DIR = PROJECT_DIR / "src" if (PROJECT_DIR / "src" / "bot.py").exists() else PROJECT_DIR
+sys.path.insert(0, str(SOURCE_DIR))
 
 from bot import Bot
 
@@ -68,7 +69,7 @@ def main():
     if not args.wiki and not args.model and not args.conversation:
         args.wiki = args.model = True
     with tempfile.TemporaryDirectory() as cache_dir:
-        bot = Bot(PROJECT_DIR / "bot.md", cache_path=Path(cache_dir) / "probe-cache.sqlite3")
+        bot = Bot(SOURCE_DIR / "bot.md", cache_path=Path(cache_dir) / "probe-cache.sqlite3")
         failures = 0
         if args.wiki:
             failures += check_wiki(bot)

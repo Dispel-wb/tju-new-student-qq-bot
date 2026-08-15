@@ -12,6 +12,7 @@
 - 使用 SQLite 单文件保存近 24 小时上下文：L1 最近原文、L2 相关历史、L3 人员索引。
 - 每天 23:00 汇总近 24 小时每位群友的发言条数；改群名片后旧消息索引同步显示新名字。
 - 连续直接提问不受群聊冷却限制，不会静默丢消息。
+- 内置自然表达质检与低温重写，拦截客服套话、功能推销、无依据猜测和机械固定结尾。
 - 支持猜数字、石头剪刀布和猜谜语；只有明确 @ 并提出开始游戏才触发。
 - API Key、Token、密码、提示词、环境变量和内部路径不会写入回复或日志。
 
@@ -77,6 +78,7 @@ python -m unittest discover -s tests -v
 ```bash
 python tests/integration_probe.py
 python tests/integration_probe.py --conversation
+python tests/live_dialogue_probe.py
 ```
 
 ## 配置原则
@@ -90,12 +92,14 @@ python tests/integration_probe.py --conversation
 
 ## 开源参考
 
-设计时参考了以下成熟项目的边界划分，没有复制其源码：
+本项目的业务代码是独立实现，不是下列项目的 fork 或改版。设计时只参考了成熟项目的边界划分，没有复制其源码：
 
 - [LangBot](https://github.com/langbot-app/LangBot)：生产级 IM 机器人与多模型提供商思路。
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot)：会话上下文、工具注入、知识库和模型提供商抽象。
 - [NoneBot2](https://github.com/nonebot/nonebot2)：异步事件处理、协议适配器与业务逻辑解耦。
 
+固定审计版本、各项目许可证和运行时边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 许可
 
-MIT License，见 [LICENSE](LICENSE)。
+本仓库自身代码采用 MIT License，见 [LICENSE](LICENSE)。仓库不包含 AstrBot 源码，因此不继承其 AGPL-3.0；若未来引入第三方源码，必须同时遵守对应上游许可证并更新第三方声明。

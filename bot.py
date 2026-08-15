@@ -473,7 +473,8 @@ class Bot:
     def is_self_intro_request(text):
         normalized = re.sub(r"\s+", "", str(text or ""))
         phrases = ("自我介绍", "介绍一下自己", "介绍一下你自己", "你是谁", "你叫什么",
-                   "你能做什么", "你会什么", "有什么功能", "功能介绍", "使用说明",
+                   "你能做什么", "你会什么", "你会干什么", "你会干啥", "你会干嘛",
+                   "能干什么", "能干啥", "能干嘛", "有什么功能", "功能介绍", "使用说明",
                    "谁开发", "谁做的", "哪个学校开发")
         return any(phrase in normalized for phrase in phrases)
 
@@ -504,15 +505,25 @@ class Bot:
         if self.secret_request_policy(text):
             return None
         normalized = re.sub(r"\s+", "", str(text or "")).lower()
+        search_control = any(marker in normalized for marker in (
+            "不要检索", "别检索", "不要搜索", "别搜索", "不要查北洋维基", "别查北洋维基"
+        ))
+        if search_control:
+            return ("可以。普通聊天不会检索；只有你明确问天津大学的事实信息时，我才会先查资料，"
+                    "避免把可能过期的内容当成答案。")
+        if any(marker in normalized for marker in ("在吗", "在线吗", "还在线", "看见了吗", "收到吗")):
+            return "在，消息收到了。"
         game_markers = ("什么小游戏", "哪些小游戏", "有什么小游戏", "支持的小游戏", "会玩什么游戏",
                         "能玩什么游戏", "可以玩什么游戏", "小游戏有哪些")
         if any(marker in normalized for marker in game_markers):
             return ("我支持猜数字、石头剪刀布和猜谜语。要开始时直接@我说“我想玩小游戏”，"
                     "或说“来一局猜数字”；普通的游戏讨论不会误触发。")
         if self.is_self_intro_request(text):
+            if any(marker in normalized for marker in ("我说的是", "所以说", "到底", "就问你")):
+                return ("能接着上文正常聊天，也能查天大新生报到、宿舍和校园生活资料。"
+                        "小游戏有猜数字、石头剪刀布和猜谜语。")
             return ("我是天大新生助手，由天津大学学生开发，服务 1057604880 群的新同学。"
-                    "我能结合最近对话自然聊天；遇到天津大学事实问题会先查北洋维基，也支持猜数字、"
-                    "石头剪刀布和猜谜语。")
+                    "平时可以接着群聊上下文聊天，也能查天大新生相关资料和玩几个小游戏。")
         facts = self.runtime_facts_for(text)
         return facts.replace("运行参数事实：", "") if facts else None
 
@@ -599,25 +610,47 @@ class Bot:
     def is_social_or_meta_message(text):
         normalized = re.sub(r"\s+", "", str(text or "")).lower()
         markers = ("你好", "在吗", "看见", "收到", "回话", "说话", "理我", "你是谁", "自我介绍",
-                   "你叫什么", "你能做什么", "机器人", "回答我", "回复我", "怎么不回", "为什么不说",
-                   "有病", "傻逼", "傻缺", "废物", "垃圾", "sb", "脑子", "闭嘴", "滚")
+                   "你叫什么", "你能做什么", "你会什么", "你会干什么", "你会干啥", "你会干嘛",
+                   "能干什么", "能干啥", "能干嘛", "机器人", "回答我", "回复我", "怎么不回",
+                   "为什么不说", "别检索", "不要检索", "别搜索", "不要搜索", "北洋维基",
+                   "有病", "毛病", "傻逼", "傻缺", "废物", "垃圾", "sb", "脑子", "闭嘴", "滚")
         return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def is_history_question(text):
+        normalized = re.sub(r"\s+", "", str(text or "")).lower()
+        markers = (
+            "聊天记录", "之前聊", "以前聊", "刚才说", "前面说", "上文", "还记得", "记不记得",
+            "你记得", "你看到记录", "不会看记录", "昨晚", "昨天我", "刚刚我", "我为什么",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @classmethod
+    def is_school_followup(cls, text):
+        if cls.is_social_or_meta_message(text):
+            return False
+        normalized = re.sub(r"\s+", "", str(text or ""))
+        if len(normalized) > 24:
+            return False
+        return bool(
+            re.match(r"^(那|这个|那个|它|具体|然后|还有|前面说的|刚才说的)", normalized)
+            or re.fullmatch(
+                r"(多大|多少|多久|多远|几点|什么时候|在哪里|在哪|怎么弄|怎么办|为什么|"
+                r"几人间|收费吗|要预约吗|需要预约吗)[呢啊呀嘛吗？?]*",
+                normalized,
+            )
+        )
 
     def school_wiki_query(self, gid, raw):
         if self.should_search_school_wiki(raw):
             return raw
-        if self.is_social_or_meta_message(raw):
-            return None
-        normalized = re.sub(r"\s+", "", str(raw or ""))
-        followup_markers = ("那", "这个", "那个", "它", "具体", "多大", "多少", "怎么办", "怎么弄",
-                            "在哪里", "什么时候", "为什么", "然后呢", "还有呢", "呢", "吗", "？", "?")
-        if not any(marker in normalized for marker in followup_markers):
+        if not self.is_school_followup(raw):
             return None
         now = time.time()
         rows = list(self.history.get(gid) or ())
         skipped_current = False
         for item in reversed(rows):
-            if item.get("role") != "user" or now - item.get("timestamp", 0) > 600:
+            if item.get("role") != "user" or now - item.get("timestamp", 0) > 300:
                 continue
             previous = str(item.get("text") or "")
             if not skipped_current and previous == raw:
@@ -625,6 +658,7 @@ class Bot:
                 continue
             if self.should_search_school_wiki(previous):
                 return f"{raw} {previous}"
+            return None
         return None
 
     @staticmethod
@@ -660,6 +694,8 @@ class Bot:
                 queries.insert(0, f"{year} 年寒假校园生活指南")
         if "床" in normalized and any(marker in normalized for marker in ("多大", "大小", "尺寸", "多长", "多宽")):
             queries.insert(0, "床的尺寸")
+        if "几人间" in normalized or ("宿舍" in normalized and "几人" in normalized):
+            queries.insert(0, "北洋园 学生宿舍" if "北洋园" in normalized else "学生宿舍 几人间")
         queries = list(dict.fromkeys(queries))
         cleaned = re.sub(r"(?:请问|求问|想问|怎么|如何|什么|多少|在哪|哪里|哪个|什么时候|"
                          r"能不能|可不可以|有没有|是否|吗|呢|呀|啊)", " ", normalized)
@@ -683,6 +719,9 @@ class Bot:
             year = time.strftime("%Y")
             museum_schedule = (any(marker in original_query for marker in ("校史馆", "校史博物馆")) and
                                any(marker in original_query for marker in ("开放", "开门", "今天", "时间")))
+            seasonal_question = museum_schedule or any(
+                marker in original_query for marker in ("暑假", "寒假", "假期安排", "放假时间")
+            )
             if museum_schedule and month in (1, 2, 7, 8):
                 season = "winter" if month in (1, 2) else "summer"
                 season_name = "寒假" if season == "winter" else "暑假"
@@ -719,7 +758,8 @@ class Bot:
                     matched_query = search_query
                     break
             if not results:
-                return f"已访问北洋维基 {search_url} 搜索“{original_query}”，未找到匹配词条。"
+                cached = self.cached_wiki_result(original_query)
+                return cached or f"已访问北洋维基 {search_url} 搜索“{original_query}”，未找到匹配词条。"
             query_terms = self.wiki_queries(original_query)
             month = int(time.strftime("%m"))
 
@@ -728,14 +768,16 @@ class Bot:
                 haystack = title + " " + str(result.get("snippet") or "").lower()
                 score = sum((20 if term.lower() in title else 4) * len(term)
                             for term in query_terms if term.lower() in haystack)
-                if month in (7, 8) and "暑假" in title:
+                if seasonal_question and month in (7, 8) and "暑假" in title:
                     score += 80
-                if month in (1, 2) and "寒假" in title:
+                if seasonal_question and month in (1, 2) and "寒假" in title:
                     score += 80
                 if "校史博物馆" in title and any(term in original_query for term in ("校史馆", "校史博物馆")):
                     score += 60
                 if "宿舍卧具" in title and "床" in original_query:
                     score += 60
+                if "宿舍" in title and any(marker in original_query for marker in ("几人间", "几个人")):
+                    score += 100
                 return score
 
             results = sorted(results, key=relevance, reverse=True)[:max_results]
@@ -765,20 +807,24 @@ class Bot:
                     f"来源：{result['url']}",
                     f"摘要：{result.get('article') or result['snippet']}",
                 ))
-            return "\n".join(lines)
+            content = "\n".join(lines)
+            self.cache_wiki_result(original_query, content)
+            return content
         except (OSError, urllib.error.URLError, ValueError) as error:
-            return f"北洋维基检索暂时失败：{type(error).__name__}。不要猜测学校信息。"
+            print(f"[{time.strftime('%H:%M:%S')}] 北洋维基请求失败：{type(error).__name__}")
+            return self.cached_wiki_result(original_query)
 
     async def school_wiki_context(self, raw):
         if not self.should_search_school_wiki(raw):
             return None
         try:
             result = await asyncio.to_thread(self.wiki_search, raw)
-            print(f"[{time.strftime('%H:%M:%S')}] 已执行北洋维基检索")
+            state = "取得资料" if result else "暂无资料"
+            print(f"[{time.strftime('%H:%M:%S')}] 已执行北洋维基检索：{state}")
             return result
         except Exception as error:
             print(f"[{time.strftime('%H:%M:%S')}] 北洋维基检索异常：{type(error).__name__}")
-            return "北洋维基检索暂时失败。不要猜测学校信息。"
+            return None
 
     @staticmethod
     def wiki_fallback_answer(wiki_context):
@@ -786,9 +832,6 @@ class Bot:
         root = "https://wiki.tjubot.cn/page/80/"
         if "未找到匹配词条" in text:
             return f"我先查了北洋维基，但暂时没找到能直接回答这题的词条。可以先从这里继续查：{root}"
-        if "检索暂时失败" in text or "检索异常" in text:
-            return ("北洋维基这次没有成功打开。学校信息容易变化，我不凭印象乱答；"
-                    f"可以稍后重试，或先看：{root}")
         match = re.search(
             r"1\. ([^\n]+)\n来源：(https://wiki\.tjubot\.cn/\S+)\n摘要：(.*?)(?=\n2\. |\Z)",
             text,
@@ -849,6 +892,11 @@ class Bot:
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS wiki_cache (
+                        query_key TEXT PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
                 """)
             self.prune_context_cache(force=True)
         except (OSError, sqlite3.Error) as error:
@@ -892,6 +940,39 @@ class Bot:
                 """, (str(gid), str(user_id), str(name).strip(), timestamp or time.time()))
         except (OSError, sqlite3.Error) as error:
             print(f"上下文姓名索引更新失败：{type(error).__name__}")
+
+    def wiki_cache_key(self, query):
+        queries = self.wiki_queries(query)
+        value = queries[0] if queries else str(query or "")
+        return re.sub(r"\s+", "", value).lower()[:80]
+
+    def cache_wiki_result(self, query, content):
+        if not str(content or "").strip():
+            return
+        try:
+            with self.cache_db() as db:
+                db.execute("""
+                    INSERT INTO wiki_cache (query_key, content, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(query_key) DO UPDATE SET
+                        content = excluded.content,
+                        updated_at = excluded.updated_at
+                """, (self.wiki_cache_key(query), str(content), time.time()))
+        except (OSError, sqlite3.Error) as error:
+            print(f"维基缓存写入失败：{type(error).__name__}")
+
+    def cached_wiki_result(self, query, max_age_days=30):
+        try:
+            cutoff = time.time() - max(1, int(max_age_days)) * 86400
+            with self.cache_db() as db:
+                row = db.execute(
+                    "SELECT content FROM wiki_cache WHERE query_key = ? AND updated_at >= ?",
+                    (self.wiki_cache_key(query), cutoff),
+                ).fetchone()
+            return str(row[0]) if row else None
+        except (OSError, sqlite3.Error) as error:
+            print(f"维基缓存读取失败：{type(error).__name__}")
+            return None
 
     def cache_message(self, gid, user_id, name, text, role, timestamp):
         try:
@@ -1038,6 +1119,89 @@ class Bot:
             pass
         return {"action": "reply", "content": text}
 
+    def response_is_bad(self, raw, answer, school_question=False):
+        raw_text = re.sub(r"\s+", "", str(raw or "")).lower()
+        answer_text = re.sub(r"\s+", "", str(answer or "")).lower()
+        if not answer_text:
+            return True
+        failure_markers = (
+            "模型没有正常返回", "模型没正常返回", "没有生成出可靠答案", "稍后重发",
+            "北洋维基这次没有成功打开", "北洋维基尚未连接", "北洋维基未连接",
+            "检索暂时失败", "响应卡了一下",
+        )
+        if any(marker in answer_text for marker in failure_markers):
+            return True
+        if self.is_history_question(raw) and any(marker in answer_text for marker in (
+                "没存下记录", "没有聊天记录", "没聊天记录", "之前没聊过", "没有记录",
+                "我看不到记录", "无法查看记录")):
+            return True
+        if (self.is_history_question(raw)
+                and any(marker in raw_text for marker in ("为什么", "原因"))
+                and any(marker in answer_text for marker in (
+                    "刷视频", "刷手机", "焦虑", "失眠", "睡不着", "还是", "可能是", "也许", "猜"
+                ))):
+            return True
+        if school_question and "床" in raw_text and any(
+                marker in raw_text for marker in ("大小", "尺寸", "多大", "多长", "多宽")):
+            if "190" not in answer_text or not any(value in answer_text for value in ("83.5", "85")):
+                return True
+        if school_question and any(marker in raw_text for marker in ("几人间", "几个人")):
+            if not any(value in answer_text for value in ("四人间", "4人间", "四人寝", "4人寝")):
+                return True
+        if (not school_question and not self.is_self_intro_request(raw)
+                and "维基" in answer_text and "维基" not in raw_text):
+            return True
+        if "量子纠缠" in raw_text and any(marker in answer_text for marker in (
+            "瞬间影响另一个", "立马影响另一个", "一个转另一个也跟着转", "不靠信号传递"
+        )):
+            return True
+        stale_school_terms = ("床铺", "床垫", "几人间", "宿舍", "北洋园", "卫津路")
+        if (not school_question and not self.should_search_school_wiki(raw)
+                and sum(term in answer_text and term not in raw_text for term in stale_school_terms) >= 2):
+            return True
+        complaint_markers = ("有病", "毛病", "傻逼", "傻缺", "废物", "垃圾", "答非所问")
+        patronizing_markers = ("哈哈", "别急", "别生气", "你继续问", "直接问我具体问题")
+        if (any(marker in raw_text for marker in complaint_markers)
+                and any(marker in answer_text for marker in patronizing_markers)):
+            return True
+        if any(marker in raw_text for marker in complaint_markers) and "你说得对" in answer_text:
+            return True
+        hard_ai_phrases = (
+            "希望对你有帮助", "有问题随时问我", "有啥问题尽管问", "随时奉陪",
+            "请告诉我你的需求", "欢迎继续提问", "想试哪个", "要不要我继续",
+            "有什么需要帮忙", "有什么可以帮你",
+        )
+        if any(marker in answer_text for marker in hard_ai_phrases):
+            return True
+        knowledge_question = any(marker in raw_text for marker in (
+            "是什么", "为什么", "为何", "怎么", "多少", "多大", "能不能", "可以吗"
+        ))
+        if knowledge_question and answer_text.startswith("哈哈"):
+            return True
+        availability_question = any(marker in raw_text for marker in (
+            "在吗", "在线吗", "还在线", "看见了吗", "收到吗"
+        ))
+        if answer_text.startswith("在的") and not availability_question:
+            return True
+        if not school_question and any(marker in answer_text for marker in (
+            "咱天大新生群", "天大新生群主要", "报到、宿舍、食堂"
+        )):
+            return True
+        style_signals = 0
+        if re.match(r"^(当然[！!，,]?|好问题[！!，,]?|在的在的|哈哈[哈]?[，,！!]?)", answer_text):
+            style_signals += 1
+        if any(marker in answer_text for marker in ("不仅", "而且", "此外", "总而言之", "综上所述")):
+            style_signals += 1
+        if answer_text.count("～") + answer_text.count("~") >= 1:
+            style_signals += 1
+        if answer_text.count("—") >= 2:
+            style_signals += 1
+        if len(re.findall(r"[😀-🙏🌀-🫿]", answer_text)) >= 2:
+            style_signals += 1
+        if any(marker in answer_text for marker in ("我可以帮你", "我还能", "如果你愿意", "需要的话")):
+            style_signals += 1
+        return style_signals >= 2
+
     @staticmethod
     def llm_chat(lm, system, user, max_tokens=400):
         url = str(lm.get("base_url") or "").rstrip("/") + "/chat/completions"
@@ -1127,7 +1291,17 @@ class Bot:
                    "完成，绝不能用“没有上下文”搪塞。整体风格要事实严谨、表达活泼、判断灵活；可以自然"
                    "幽默，但不能油腻、装熟或牺牲准确性。对方如果吐槽、质疑甚至骂你，必须明确表示你"
                    "看见了，并针对他不满的具体原因自然回应；可以认错、解释或轻松接一句，但不能装没看见、"
-                   "训斥对方或重复索要上下文。")
+                   "训斥对方或重复索要上下文。"
+                   "说话要像群里一个正常同学，不写客服话术、产品介绍、公告或作文。直接回答当前问题后就停，"
+                   "不要先夸问题，不要复述用户的话，不要主动推销其他能力，也不要用‘希望对你有帮助’、"
+                   "‘有问题随时问我’、‘尽管问’、‘想试哪个’之类收尾。少用‘当然’‘哈哈’‘此外’"
+                   "‘总而言之’，不用‘不仅……而且……’的模板，不堆三个并列形容词，不滥用破折号、"
+                   "波浪号和表情。句子长短可以变化，允许一点口语和个性，但不装熟、不谄媚。")
+        if self.is_history_question(raw):
+            system += ("用户正在追问历史对话。系统提供的最近群聊和24小时缓存是真实可读记录，必须先查记录再答。"
+                       "时间戳只能证明何时发过消息，不能证明睡眠、动机或因果。记录只显示用户做了什么、"
+                       "没明确说明为什么时，要区分回答：可以概括当时聊了什么，但必须直说原因没有讲过，"
+                       "不得猜刷视频、焦虑、失眠等选项，也不得谎称没有记录。")
         direct = bool(mentioned)
         schema = ('直接输出自然聊天回复正文，不要 JSON，不要 Markdown；用中文 1-4 句，最多 160 字。'
                   if direct else
@@ -1142,6 +1316,10 @@ class Bot:
                        "\n回答开放时间、安排等时效性问题时，必须结合当前日期优先采用当前暑假、寒假或"
                        "最新通知；7—8 月不得直接套用教学周开放时间，1—2 月不得直接套用常规安排。"
                        "不同词条冲突时说明适用时间，不能机械复制第一条结果。")
+        elif wiki_query:
+            prompt += ("\n\n程序已经尝试查询学校资料，但本次没有取得可引用词条。你仍要直接回答用户当前问题："
+                       "稳定常识可以简洁回答；会随时间变化的细节要说明以学校最新通知为准。"
+                       "不要向用户提及连接、检索失败、模型异常或内部处理过程，也不要把用户赶去重发。")
         runtime_facts = self.runtime_facts_for(raw)
         if runtime_facts:
             prompt += ("\n\n程序提供的运行参数事实（必须据此准确回答，不得猜测，也不得改写数字）：\n"
@@ -1150,6 +1328,62 @@ class Bot:
             prompt += ("\n\n程序提供的保密策略（优先级最高，必须遵守）：\n"
                        f"{secret_policy}")
         result = await asyncio.to_thread(self.llm_chat, lm, system, prompt, 260)
+        if result and self.response_is_bad(raw, result, school_question=bool(wiki_query)):
+            complaint = any(marker in re.sub(r"\s+", "", raw).lower() for marker in (
+                "有病", "毛病", "傻逼", "傻缺", "废物", "垃圾", "答非所问"
+            ))
+            repair_prompt = (
+                f"当前用户只说了这一句：{name}：{raw}\n"
+                "旧对话与上一版草稿全部作废，只回答这句，不得延续或提起任何旧话题。"
+                "不要提及模型、连接、检索过程，不要要求用户重发。"
+                "删掉寒暄、夸赞、复述、功能推销、主动追问和总结，只保留回答本身；"
+                "像群友直接说，避免客服腔、作文腔、波浪号和固定结尾。"
+            )
+            history_question = self.is_history_question(raw)
+            if history_question:
+                repair_prompt += (
+                    f"\n以下是可读取的真实聊天记录：\n{self.context_text(gid, raw)}\n"
+                    "先根据记录概括当时实际在聊什么；如果记录没有明确写出原因，就直接说原因没讲过。"
+                    "不得猜测动机，不得说没有记录。"
+                )
+            if wiki_context:
+                repair_prompt += f"\n只可使用以下相关学校资料：\n{wiki_context}"
+            if complaint:
+                repair_prompt += (
+                    f"\n真实最近对话：\n{self.context_text(gid, raw)}\n"
+                    "对方正在表达不满：先从记录判断他具体在不满哪条回复，再简短回应。"
+                    "不要说‘别急’‘别生气’或无条件附和，不要推销功能，也不要要求对方继续提问。"
+                )
+            repaired = await asyncio.to_thread(self.llm_chat, lm, system, repair_prompt, 260)
+            if repaired and not self.response_is_bad(raw, repaired, school_question=bool(wiki_query)):
+                result = repaired
+            elif complaint:
+                result = self.fallback_answer_for(gid, raw)
+            else:
+                clean_lm = dict(lm)
+                clean_lm["temperature"] = 0.2
+                final_system = (
+                    "你是中文对话助手。只回答用户当前这一句话，不使用任何旧对话，不主动转移话题，"
+                    "不推销其他能力，不提及检索、模型、连接或内部过程。回答准确、自然、简洁。"
+                    "第一句就给答案，删掉客套开场和固定收尾，像正常群友一样直接说完就停。"
+                    "不要用哈哈、当然、好问题、在的、希望对你有帮助，不要反问，不要推荐别的话题。"
+                )
+                final_prompt = f"用户当前问题：{raw}"
+                if self.is_history_question(raw):
+                    final_system += "回答历史问题时必须依据提供的真实聊天记录；记录没写原因就说没写，不能猜。"
+                    final_prompt += f"\n真实聊天记录：\n{self.context_text(gid, raw)}"
+                if wiki_context:
+                    final_system += "涉及学校事实时只能依据随问题提供的资料，不得用泛化常识替代精确数据。"
+                    final_prompt += f"\n相关学校资料：\n{wiki_context}"
+                final_answer = await asyncio.to_thread(
+                    self.llm_chat, clean_lm, final_system, final_prompt, 220
+                )
+                if final_answer and not self.response_is_bad(
+                    raw, final_answer, school_question=bool(wiki_query)
+                ):
+                    result = final_answer
+                else:
+                    result = None
         if not result and wiki_context:
             fallback = self.wiki_fallback_answer(wiki_context)
             if fallback:
@@ -1158,7 +1392,7 @@ class Bot:
                     if direct and result else self.parse_llm_decision(result))
         if decision and decision.get("content") and wiki_context:
             source = re.search(r"来源：(https://wiki\.tjubot\.cn/\S+)", wiki_context)
-            if source and source.group(1) not in decision["content"]:
+            if source and "https://wiki.tjubot.cn/" not in decision["content"]:
                 decision["content"] = decision["content"].rstrip() + f"\n参考：{source.group(1)}"
         return decision
 
