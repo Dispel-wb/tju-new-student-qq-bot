@@ -51,6 +51,20 @@ def private_event(text):
     }
 
 
+def group_event(text, message=None, message_id=7001, user_id=556677):
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "group_id": 1057604880,
+        "user_id": user_id,
+        "self_id": 2707817973,
+        "message_id": message_id,
+        "message": message if message is not None else [{"type": "text", "data": {"text": text}}],
+        "raw_message": text,
+        "sender": {"nickname": "群友"},
+    }
+
+
 def sent_text(websocket, index=-1):
     return str(websocket.sent[index]["params"]["message"])
 
@@ -84,6 +98,88 @@ class BotBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.requested_game("你可以和我玩什么小游戏"))
         self.assertIsNone(self.bot.requested_game("我们在讨论小游戏开发"))
         self.assertIsNone(self.bot.requested_game("原神这个游戏好玩吗"))
+
+    def test_message_segments_recognize_faces_and_stickers(self):
+        event = group_event("", message=[
+            {"type": "face", "data": {"id": "14"}},
+            {"type": "image", "data": {
+                "summary": "猫猫震惊", "emoji_id": "abc", "emoji_package_id": "pkg",
+                "key": "key", "url": "https://example.invalid/cat.gif",
+            }},
+        ])
+        text = self.bot.norm_text(event)
+        self.assertIn("QQ表情：微笑", text)
+        self.assertIn("表情包：猫猫震惊", text)
+        self.assertEqual("赞", self.bot.face_name({"id": "76", "raw": {"faceText": "/赞"}}))
+
+    def test_outgoing_face_and_repeat_sticker_segments(self):
+        face = self.bot.outgoing_message("行。[表情:赞]")
+        self.assertEqual("face", face[-1]["type"])
+        self.assertEqual("76", face[-1]["data"]["id"])
+        self.assertNotIn("表情:", face[0]["data"]["text"])
+        event = group_event("", message=[{"type": "image", "data": {
+            "summary": "猫猫震惊", "emoji_id": "abc", "emoji_package_id": "pkg", "key": "key"
+        }}])
+        repeated = self.bot.outgoing_message("同感。[表情:回同款]", event)
+        self.assertEqual("mface", repeated[-1]["type"])
+        self.assertEqual("abc", repeated[-1]["data"]["emoji_id"])
+
+    async def test_quoted_message_is_resolved_and_reply_is_threaded(self):
+        websocket = FakeWebSocket()
+        event = group_event("那这个呢", message=[
+            {"type": "reply", "data": {"id": "6001"}},
+            {"type": "text", "data": {"text": "那这个呢"}},
+        ])
+        quoted_data = {
+            "user_id": 2707817973,
+            "sender": {"nickname": "天大新生助手", "user_id": 2707817973},
+            "message": [{"type": "text", "data": {"text": "北洋园本科生一般是四人间。"}}],
+        }
+        with mock.patch.object(self.bot, "call_onebot", mock.AsyncMock(return_value=quoted_data)), \
+                mock.patch.object(self.bot, "llm_ready", return_value=True), \
+                mock.patch.object(self.bot, "llm_decide", mock.AsyncMock(return_value={
+                    "action": "reply", "content": "你引用的是北洋园本科宿舍，一般是四人间。"
+                })):
+            await self.bot.on_message(websocket, event)
+        message = websocket.sent[-1]["params"]["message"]
+        self.assertEqual("reply", message[0]["type"])
+        self.assertEqual("7001", message[0]["data"]["id"])
+        context = self.bot.context_text(1057604880)
+        self.assertIn("引用 天大新生助手", context)
+        self.assertIn("四人间", context)
+
+    def test_profiles_and_relationship_scores_are_explainable(self):
+        event = group_event("谢谢提醒，我来发你资料？", message=[
+            {"type": "at", "data": {"qq": "778899"}},
+            {"type": "text", "data": {"text": "谢谢提醒，我来发你资料？"}},
+            {"type": "face", "data": {"id": "14"}},
+        ])
+        self.bot.update_user_profile(1057604880, 556677, "群友", self.bot.norm_text(event), event)
+        profile = self.bot.user_profile(1057604880, 556677)
+        self.assertEqual(1, profile["message_count"])
+        self.assertEqual(1, profile["sticker_count"])
+        self.assertEqual(1, profile["question_count"])
+        self.assertGreater(profile["positive_signals"], 0)
+        self.bot.update_relationship(1057604880, 556677, 778899, "谢谢，我来帮你", mentioned=True)
+        self.bot.update_relationship(1057604880, 778899, 556677, "收到，谢谢", replied=True)
+        forward = self.bot.relationship_profile(1057604880, 556677, 778899)
+        reverse = self.bot.relationship_profile(1057604880, 778899, 556677)
+        self.assertGreater(forward["familiarity_score"], 0)
+        self.assertGreater(forward["reciprocity_score"], 0)
+        self.assertGreater(reverse["reciprocity_score"], 0)
+        self.assertGreater(forward["confidence"], 0)
+
+    def test_group_member_stats_include_activity(self):
+        gid = 1057604880
+        self.bot.add_history(gid, "甲", "第一条", user_id=1)
+        self.bot.add_history(gid, "乙", "第二条", user_id=2)
+        self.assertTrue(self.bot.save_group_stats(gid, 328, 500, "新生群"))
+        stats = self.bot.group_stats(gid)
+        self.assertEqual(328, stats["member_count"])
+        self.assertEqual(2, stats["active_24h"])
+        answer = self.bot.group_stats_answer(gid, "群里多少人")
+        self.assertIn("328 人", answer)
+        self.assertIn("2 人发言", answer)
 
     def test_school_search_routing_is_precise(self):
         self.assertTrue(self.bot.should_search_school_wiki("校史馆几点开门"))
@@ -132,6 +228,22 @@ class BotBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.bot.add_history(gid, "测试员", "那具体呢？", user_id=2450036920)
         self.assertIsNone(self.bot.school_wiki_query(gid, "那具体呢？"))
 
+    def test_quoted_graduate_dorm_followup_builds_precise_query(self):
+        raw = "【引用 张三：北洋园本科生一般是四人间。】那研究生呢？"
+        query = self.bot.school_wiki_query(1057604880, raw)
+        self.assertEqual("北洋园 研究生宿舍 几人间", query)
+        self.assertEqual("北洋园 研究生宿舍", self.bot.wiki_queries(query)[0])
+        self.assertTrue(self.bot.response_is_bad(
+            query,
+            "研究生一般两人间。参考：https://wiki.tjubot.cn/courses/timetable-peiyang-262701",
+            school_question=True,
+        ))
+        self.assertFalse(self.bot.response_is_bad(
+            query,
+            "研究生宿舍房型以分配为准。参考：https://wiki.tjubot.cn/dorm/dorm-peiyang-master",
+            school_question=True,
+        ))
+
     def test_wiki_success_is_cached_for_network_outage(self):
         cached = (
             "已先访问北洋维基 https://wiki.tjubot.cn/page/80/，以关键词“床的尺寸”搜索。\n"
@@ -171,6 +283,23 @@ class BotBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(self.bot.response_is_bad(
             "量子纠缠是什么", "测量一个会瞬间影响另一个的状态。", school_question=False
+        ))
+        self.assertTrue(self.bot.response_is_bad(
+            "量子纠缠是什么意思", "我也就懂个大概，去B站搜科普吧。", school_question=False
+        ))
+        self.assertTrue(self.bot.response_is_bad(
+            "量子纠缠是什么意思", "我不是物理老师，没法解释清楚，你自己搜点科普。",
+            school_question=False,
+        ))
+        self.assertTrue(self.bot.response_is_bad(
+            "量子纠缠是什么意思", "（暂无上下文）", school_question=False
+        ))
+        self.assertTrue(self.bot.response_is_bad(
+            "量子纠缠是什么意思", "这问题有点突然，咱这群里聊这个干嘛？",
+            school_question=False,
+        ))
+        self.assertTrue(self.bot.response_is_bad(
+            "量子纠缠是什么意思", "没聊过这个，你记岔了。", school_question=False
         ))
         self.assertTrue(self.bot.response_is_bad(
             "你有病吧", "我可能确实有毛病，你说得对。", school_question=False
@@ -236,8 +365,9 @@ class BotBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.bot.add_history(1057604880, "甲同学", "一", user_id=1)
         self.bot.add_history(1057604880, "乙同学", "二", user_id=2)
         websocket = FakeWebSocket()
-        self.assertTrue(await self.bot.send_daily_summary(websocket, 1057604880))
-        self.assertFalse(await self.bot.send_daily_summary(websocket, 1057604880))
+        with mock.patch.object(self.bot, "refresh_group_stats", mock.AsyncMock(return_value=False)):
+            self.assertTrue(await self.bot.send_daily_summary(websocket, 1057604880))
+            self.assertFalse(await self.bot.send_daily_summary(websocket, 1057604880))
         self.assertEqual(1, len(websocket.sent))
         report = sent_text(websocket)
         self.assertIn("甲同学：1 条", report)

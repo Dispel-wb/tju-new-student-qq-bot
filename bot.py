@@ -13,6 +13,7 @@
 """
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -323,6 +324,7 @@ class Bot:
         self.last_sent = defaultdict(str)
         self.game_sessions = {}
         self.conversation_locks = defaultdict(asyncio.Lock)
+        self.api_waiters = {}
         self.fallback_cursor = defaultdict(int)
         self.game_hint_state_file = BASE_DIR.parent / "data" / "game-hint.json"
         self.context_cache_file = None
@@ -389,19 +391,130 @@ class Bot:
                 return False
         return t in text
 
-    @staticmethod
-    def norm_text(ev):
+    FACE_NAMES = {
+        "0": "惊讶", "1": "撇嘴", "4": "得意", "5": "流泪", "6": "害羞",
+        "8": "睡觉", "9": "大哭", "10": "尴尬", "11": "生气", "12": "调皮",
+        "13": "呲牙", "14": "微笑", "16": "酷", "20": "偷笑", "21": "可爱",
+        "22": "白眼", "24": "饥饿", "25": "困", "26": "惊恐", "27": "流汗",
+        "28": "憨笑", "30": "奋斗", "32": "疑问", "33": "嘘", "34": "晕",
+        "38": "敲打", "39": "再见", "46": "猪头", "49": "拥抱", "66": "爱心",
+        "67": "心碎", "76": "赞", "77": "踩", "79": "胜利", "96": "冷汗",
+        "97": "擦汗", "98": "抠鼻", "99": "鼓掌", "100": "糗大了",
+        "101": "坏笑", "104": "哈欠", "105": "鄙视", "106": "委屈",
+        "107": "快哭了", "108": "阴险", "109": "亲亲", "111": "可怜",
+        "118": "抱拳", "123": "不", "124": "好",
+    }
+    SEND_FACE_IDS = {
+        "微笑": "14", "呲牙": "13", "偷笑": "20", "可爱": "21", "疑问": "32",
+        "赞": "76", "鼓掌": "99", "抱拳": "118", "委屈": "106", "流泪": "5",
+        "生气": "11", "再见": "39", "爱心": "66", "胜利": "79", "白眼": "22",
+    }
+
+    @classmethod
+    def face_name(cls, data):
+        raw = data.get("raw") if isinstance(data, dict) else None
+        candidates = (
+            data.get("summary") if isinstance(data, dict) else None,
+            raw.get("faceText") if isinstance(raw, dict) else None,
+            raw.get("QDes") if isinstance(raw, dict) else None,
+        )
+        for value in candidates:
+            value = str(value or "").strip().strip("[]").lstrip("/").strip()
+            if value:
+                return value
+        face_id = str((data or {}).get("id") or "")
+        return cls.FACE_NAMES.get(face_id, f"QQ表情{face_id}" if face_id else "QQ表情")
+
+    @classmethod
+    def segment_text(cls, segment):
+        if not isinstance(segment, dict):
+            return ""
+        kind = str(segment.get("type") or "")
+        data = segment.get("data") or {}
+        if kind == "text":
+            return str(data.get("text") or "")
+        if kind == "face":
+            return f"【QQ表情：{cls.face_name(data)}】"
+        if kind in ("mface", "market_face"):
+            summary = str(data.get("summary") or "商城表情").strip().strip("[]")
+            return f"【表情包：{summary}】"
+        if kind == "image":
+            summary = str(data.get("summary") or "").strip().strip("[]")
+            is_sticker = bool(data.get("emoji_id") or data.get("emoji_package_id"))
+            if is_sticker or (summary and summary not in ("图片", "动画表情")):
+                return f"【表情包：{summary or '未命名'}】"
+            if summary == "动画表情" or str(data.get("sub_type") or "") in ("1", "7"):
+                return "【表情包图片】"
+            return "【图片】"
+        if kind == "dice":
+            return f"【骰子：{data.get('result', '?')}】"
+        if kind == "rps":
+            return f"【猜拳：{data.get('result', '?')}】"
+        if kind == "record":
+            return "【语音】"
+        if kind == "video":
+            return "【视频】"
+        return ""
+
+    @classmethod
+    def norm_text(cls, ev):
         message = ev.get("message") or []
         if isinstance(message, list):
-            raw = "".join(
-                str((seg.get("data") or {}).get("text") or "")
-                for seg in message
-                if isinstance(seg, dict) and str(seg.get("type")) == "text"
-            )
+            raw = " ".join(filter(None, (cls.segment_text(seg) for seg in message)))
         else:
             raw = ev.get("raw_message") or message or ""
-        raw = re.sub(r"\[CQ:[^\]]+\]", "", str(raw))
+            raw = re.sub(
+                r"\[CQ:face,id=([^,\]]+)[^\]]*\]",
+                lambda match: f"【QQ表情：{cls.FACE_NAMES.get(match.group(1), 'QQ表情' + match.group(1))}】",
+                str(raw), flags=re.IGNORECASE,
+            )
+            raw = re.sub(r"\[CQ:image,[^\]]+\]", "【图片或表情包】", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\[CQ:(?:reply|at),[^\]]+\]", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\[CQ:[^\]]+\]", "", raw)
         return re.sub(r"\s+", " ", unescape(raw)).strip()
+
+    @staticmethod
+    def reply_message_id(ev):
+        message = ev.get("message") or []
+        if isinstance(message, list):
+            for segment in message:
+                if isinstance(segment, dict) and str(segment.get("type")) == "reply":
+                    value = (segment.get("data") or {}).get("id")
+                    if value is not None:
+                        return str(value)
+        match = re.search(r"\[CQ:reply,id=([^,\]]+)", str(ev.get("raw_message") or ""), re.I)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def incoming_sticker_segment(ev):
+        message = ev.get("message") or []
+        if not isinstance(message, list):
+            return None
+        for segment in message:
+            if not isinstance(segment, dict):
+                continue
+            kind = str(segment.get("type") or "")
+            data = segment.get("data") or {}
+            if kind in ("mface", "market_face"):
+                return {"type": "mface", "data": {
+                    "emoji_package_id": data.get("emoji_package_id"),
+                    "emoji_id": data.get("emoji_id"), "key": data.get("key"),
+                    "summary": data.get("summary") or "商城表情",
+                }}
+            if kind == "image" and (data.get("emoji_id") or data.get("emoji_package_id")):
+                if data.get("emoji_id") and data.get("emoji_package_id") and data.get("key"):
+                    return {"type": "mface", "data": {
+                        "emoji_package_id": data.get("emoji_package_id"),
+                        "emoji_id": data.get("emoji_id"), "key": data.get("key"),
+                        "summary": data.get("summary") or "商城表情",
+                    }}
+                file_value = data.get("url") or data.get("file")
+                if file_value:
+                    return {"type": "image", "data": {
+                        "file": file_value, "summary": data.get("summary") or "表情包",
+                        "sub_type": data.get("sub_type") or 1,
+                    }}
+        return None
 
     def user_name(self, ev):
         s = ev.get("sender") or {}
@@ -592,6 +705,14 @@ class Bot:
         value = self.cfg.get("school_wiki") or {}
         return value if isinstance(value, dict) else {}
 
+    def message_features_cfg(self):
+        value = self.cfg.get("message_features") or {}
+        return value if isinstance(value, dict) else {}
+
+    def profiling_cfg(self):
+        value = self.cfg.get("profiling") or {}
+        return value if isinstance(value, dict) else {}
+
     def should_search_school_wiki(self, text):
         if not self.school_wiki_cfg().get("enabled", True):
             return False
@@ -642,6 +763,13 @@ class Bot:
         )
 
     def school_wiki_query(self, gid, raw):
+        quote_match = re.match(r"【引用 [^：]+：(.*?)】\s*(.*)", str(raw or ""), re.DOTALL)
+        if quote_match:
+            quoted_text, current_text = quote_match.groups()
+            dorm_markers = ("宿舍", "几人间", "四人间", "双人间", "床位")
+            if "研究生" in current_text and any(marker in quoted_text for marker in dorm_markers):
+                campus = "北洋园" if "北洋园" in quoted_text else ("卫津路" if "卫津路" in quoted_text else "")
+                return f"{campus} 研究生宿舍 几人间".strip()
         if self.should_search_school_wiki(raw):
             return raw
         if not self.is_school_followup(raw):
@@ -696,6 +824,8 @@ class Bot:
             queries.insert(0, "床的尺寸")
         if "几人间" in normalized or ("宿舍" in normalized and "几人" in normalized):
             queries.insert(0, "北洋园 学生宿舍" if "北洋园" in normalized else "学生宿舍 几人间")
+        if "研究生" in normalized and any(marker in normalized for marker in ("宿舍", "几人间", "床位")):
+            queries.insert(0, "北洋园 研究生宿舍" if "北洋园" in normalized else "研究生宿舍")
         queries = list(dict.fromkeys(queries))
         cleaned = re.sub(r"(?:请问|求问|想问|怎么|如何|什么|多少|在哪|哪里|哪个|什么时候|"
                          r"能不能|可不可以|有没有|是否|吗|呢|呀|啊)", " ", normalized)
@@ -778,6 +908,12 @@ class Bot:
                     score += 60
                 if "宿舍" in title and any(marker in original_query for marker in ("几人间", "几个人")):
                     score += 100
+                graduate_dorm = ("研究生" in original_query and
+                                 any(marker in original_query for marker in ("宿舍", "几人间", "床位")))
+                if graduate_dorm and "宿舍" in title:
+                    score += 140
+                if graduate_dorm and any(marker in title for marker in ("课表", "课程", "选课", "培养", "招生")):
+                    score -= 200
                 return score
 
             results = sorted(results, key=relevance, reverse=True)[:max_results]
@@ -897,14 +1033,117 @@ class Bot:
                         content TEXT NOT NULL,
                         updated_at REAL NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS group_stats (
+                        group_id TEXT PRIMARY KEY,
+                        group_name TEXT NOT NULL DEFAULT '',
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        max_member_count INTEGER NOT NULL DEFAULT 0,
+                        active_24h INTEGER NOT NULL DEFAULT 0,
+                        message_24h INTEGER NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        conversation_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        current_name TEXT NOT NULL,
+                        first_seen REAL NOT NULL,
+                        last_seen REAL NOT NULL,
+                        message_count INTEGER NOT NULL DEFAULT 0,
+                        char_count INTEGER NOT NULL DEFAULT 0,
+                        question_count INTEGER NOT NULL DEFAULT 0,
+                        sticker_count INTEGER NOT NULL DEFAULT 0,
+                        quote_count INTEGER NOT NULL DEFAULT 0,
+                        mention_count INTEGER NOT NULL DEFAULT 0,
+                        positive_signals INTEGER NOT NULL DEFAULT 0,
+                        negative_signals INTEGER NOT NULL DEFAULT 0,
+                        helpful_signals INTEGER NOT NULL DEFAULT 0,
+                        profile_summary TEXT NOT NULL DEFAULT '',
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (conversation_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS relationship_edges (
+                        conversation_id TEXT NOT NULL,
+                        source_user_id TEXT NOT NULL,
+                        target_user_id TEXT NOT NULL,
+                        interactions INTEGER NOT NULL DEFAULT 0,
+                        replies INTEGER NOT NULL DEFAULT 0,
+                        mentions INTEGER NOT NULL DEFAULT 0,
+                        positive_signals INTEGER NOT NULL DEFAULT 0,
+                        negative_signals INTEGER NOT NULL DEFAULT 0,
+                        helpful_signals INTEGER NOT NULL DEFAULT 0,
+                        familiarity_score REAL NOT NULL DEFAULT 0,
+                        warmth_score REAL NOT NULL DEFAULT 50,
+                        reciprocity_score REAL NOT NULL DEFAULT 0,
+                        tension_score REAL NOT NULL DEFAULT 0,
+                        overall_score REAL NOT NULL DEFAULT 50,
+                        confidence REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (conversation_id, source_user_id, target_user_id)
+                    );
                 """)
             self.prune_context_cache(force=True)
+            self.backfill_user_profiles()
         except (OSError, sqlite3.Error) as error:
             print(f"上下文缓存初始化失败：{type(error).__name__}")
 
     @staticmethod
     def cache_user_key(user_id, name):
         return str(user_id) if user_id is not None else f"name:{name}"
+
+    def backfill_user_profiles(self):
+        if not self.profiling_cfg().get("enabled", True):
+            return
+        try:
+            with self.cache_db() as db:
+                if db.execute("SELECT 1 FROM user_profiles LIMIT 1").fetchone():
+                    return
+                rows = db.execute("""
+                    SELECT m.conversation_id, m.user_id,
+                           COALESCE(u.current_name, MAX(m.original_name)),
+                           MIN(m.timestamp), MAX(m.timestamp), m.text
+                    FROM messages m
+                    LEFT JOIN users u ON u.conversation_id = m.conversation_id
+                                     AND u.user_id = m.user_id
+                    WHERE m.role = 'user'
+                    GROUP BY m.conversation_id, m.user_id, m.id
+                    ORDER BY m.timestamp
+                """).fetchall()
+                aggregates = {}
+                for gid, user_id, name, first_seen, last_seen, text in rows:
+                    key = (gid, user_id)
+                    item = aggregates.setdefault(key, {
+                        "name": name, "first": first_seen, "last": last_seen, "messages": 0,
+                        "chars": 0, "questions": 0, "stickers": 0, "quotes": 0,
+                        "positive": 0, "negative": 0, "helpful": 0,
+                    })
+                    positive, negative, helpful = self.behavior_signals(text)
+                    item["name"] = name or item["name"]
+                    item["last"] = max(item["last"], last_seen)
+                    item["messages"] += 1
+                    item["chars"] += len(str(text or ""))
+                    item["questions"] += int(any(mark in str(text or "") for mark in ("?", "？", "吗", "怎么")))
+                    item["stickers"] += int(any(mark in str(text or "") for mark in ("【QQ表情：", "【表情包：")))
+                    item["quotes"] += int("【引用 " in str(text or ""))
+                    item["positive"] += positive
+                    item["negative"] += negative
+                    item["helpful"] += helpful
+                for (gid, user_id), item in aggregates.items():
+                    summary = self.profile_summary_for(
+                        item["messages"], item["chars"], item["questions"], item["stickers"],
+                        item["quotes"], item["positive"], item["negative"], item["helpful"],
+                    )
+                    db.execute("""
+                        INSERT OR IGNORE INTO user_profiles (
+                            conversation_id, user_id, current_name, first_seen, last_seen,
+                            message_count, char_count, question_count, sticker_count, quote_count,
+                            positive_signals, negative_signals, helpful_signals, profile_summary, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (gid, user_id, str(item["name"] or user_id), item["first"], item["last"],
+                          item["messages"], item["chars"], item["questions"], item["stickers"],
+                          item["quotes"], item["positive"], item["negative"], item["helpful"],
+                          summary, item["last"]))
+        except (OSError, sqlite3.Error) as error:
+            print(f"历史画像回填失败：{type(error).__name__}")
 
     def prune_context_cache(self, force=False):
         now = time.time()
@@ -923,6 +1162,10 @@ class Bot:
                           AND messages.user_id = users.user_id
                     )
                 """)
+                retention_days = max(1, int(self.profiling_cfg().get("retention_days") or 180))
+                profile_cutoff = now - retention_days * 86400
+                db.execute("DELETE FROM user_profiles WHERE updated_at < ?", (profile_cutoff,))
+                db.execute("DELETE FROM relationship_edges WHERE updated_at < ?", (profile_cutoff,))
         except (OSError, sqlite3.Error) as error:
             print(f"上下文缓存清理失败：{type(error).__name__}")
 
@@ -938,8 +1181,212 @@ class Bot:
                         current_name = excluded.current_name,
                         updated_at = excluded.updated_at
                 """, (str(gid), str(user_id), str(name).strip(), timestamp or time.time()))
+                db.execute("""
+                    UPDATE user_profiles SET current_name = ?, updated_at = ?
+                    WHERE conversation_id = ? AND user_id = ?
+                """, (str(name).strip(), timestamp or time.time(), str(gid), str(user_id)))
         except (OSError, sqlite3.Error) as error:
             print(f"上下文姓名索引更新失败：{type(error).__name__}")
+
+    @staticmethod
+    def behavior_signals(text):
+        value = re.sub(r"\s+", "", str(text or "")).lower()
+        positive = sum(marker in value for marker in (
+            "谢谢", "感谢", "辛苦", "厉害", "真棒", "哈哈", "好耶", "赞", "爱了", "可以的"
+        ))
+        negative = sum(marker in value for marker in (
+            "有病", "傻逼", "傻缺", "废物", "垃圾", "闭嘴", "滚", "烦死", "答非所问"
+        ))
+        helpful = sum(marker in value for marker in (
+            "可以去", "建议", "记得", "提醒", "我来", "我帮", "发你", "链接", "资料", "别忘"
+        ))
+        return positive, negative, helpful
+
+    @classmethod
+    def profile_summary_for(cls, message_count, char_count, question_count, sticker_count,
+                            quote_count, positive_signals, negative_signals, helpful_signals):
+        if message_count <= 0:
+            return "样本不足"
+        traits = []
+        average_length = char_count / message_count
+        if average_length <= 12:
+            traits.append("表达偏简短")
+        elif average_length >= 45:
+            traits.append("表达较详细")
+        if question_count / message_count >= 0.35:
+            traits.append("经常提问")
+        if quote_count / message_count >= 0.2:
+            traits.append("常用引用接续话题")
+        if sticker_count / message_count >= 0.2:
+            traits.append("常用表情表达语气")
+        if helpful_signals >= max(2, negative_signals + 1):
+            traits.append("观察到较多帮助性表达")
+        if positive_signals >= max(2, negative_signals * 2):
+            traits.append("观察到的互动语气偏积极")
+        elif negative_signals >= max(2, positive_signals * 2):
+            traits.append("观察到的冲突语气偏多")
+        return "、".join(traits[:4]) or "互动风格尚不明显"
+
+    def update_user_profile(self, gid, user_id, name, text, ev, quoted=False):
+        if gid is None or user_id is None:
+            return
+        message = ev.get("message") or []
+        segments = message if isinstance(message, list) else []
+        sticker_count = sum(
+            str(segment.get("type")) in ("face", "image", "mface", "market_face")
+            for segment in segments if isinstance(segment, dict)
+        )
+        mention_count = sum(
+            str(segment.get("type")) == "at" for segment in segments if isinstance(segment, dict)
+        )
+        positive, negative, helpful = self.behavior_signals(text)
+        question_count = int(any(mark in str(text or "") for mark in ("?", "？", "吗", "呢", "怎么", "为何")))
+        now = time.time()
+        try:
+            with self.cache_db() as db:
+                db.execute("""
+                    INSERT INTO user_profiles (
+                        conversation_id, user_id, current_name, first_seen, last_seen,
+                        message_count, char_count, question_count, sticker_count, quote_count,
+                        mention_count, positive_signals, negative_signals, helpful_signals, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, user_id) DO UPDATE SET
+                        current_name = excluded.current_name,
+                        last_seen = excluded.last_seen,
+                        message_count = user_profiles.message_count + 1,
+                        char_count = user_profiles.char_count + excluded.char_count,
+                        question_count = user_profiles.question_count + excluded.question_count,
+                        sticker_count = user_profiles.sticker_count + excluded.sticker_count,
+                        quote_count = user_profiles.quote_count + excluded.quote_count,
+                        mention_count = user_profiles.mention_count + excluded.mention_count,
+                        positive_signals = user_profiles.positive_signals + excluded.positive_signals,
+                        negative_signals = user_profiles.negative_signals + excluded.negative_signals,
+                        helpful_signals = user_profiles.helpful_signals + excluded.helpful_signals,
+                        updated_at = excluded.updated_at
+                """, (str(gid), str(user_id), str(name or user_id), now, now, len(str(text or "")),
+                      question_count, sticker_count, int(bool(quoted)), mention_count,
+                      positive, negative, helpful, now))
+                row = db.execute("""
+                    SELECT message_count, char_count, question_count, sticker_count, quote_count,
+                           positive_signals, negative_signals, helpful_signals
+                    FROM user_profiles WHERE conversation_id = ? AND user_id = ?
+                """, (str(gid), str(user_id))).fetchone()
+                if row:
+                    summary = self.profile_summary_for(*row)
+                    db.execute("""
+                        UPDATE user_profiles SET profile_summary = ?, updated_at = ?
+                        WHERE conversation_id = ? AND user_id = ?
+                    """, (summary, now, str(gid), str(user_id)))
+        except (OSError, sqlite3.Error) as error:
+            print(f"用户画像更新失败：{type(error).__name__}")
+
+    def update_relationship(self, gid, source_id, target_id, text, replied=False, mentioned=False):
+        if gid is None or source_id is None or target_id is None or str(source_id) == str(target_id):
+            return
+        positive, negative, helpful = self.behavior_signals(text)
+        now = time.time()
+        try:
+            with self.cache_db() as db:
+                db.execute("""
+                    INSERT INTO relationship_edges (
+                        conversation_id, source_user_id, target_user_id, interactions, replies,
+                        mentions, positive_signals, negative_signals, helpful_signals, updated_at
+                    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, source_user_id, target_user_id) DO UPDATE SET
+                        interactions = relationship_edges.interactions + 1,
+                        replies = relationship_edges.replies + excluded.replies,
+                        mentions = relationship_edges.mentions + excluded.mentions,
+                        positive_signals = relationship_edges.positive_signals + excluded.positive_signals,
+                        negative_signals = relationship_edges.negative_signals + excluded.negative_signals,
+                        helpful_signals = relationship_edges.helpful_signals + excluded.helpful_signals,
+                        updated_at = excluded.updated_at
+                """, (str(gid), str(source_id), str(target_id), int(bool(replied)), int(bool(mentioned)),
+                      positive, negative, helpful, now))
+                row = db.execute("""
+                    SELECT interactions, positive_signals, negative_signals, helpful_signals
+                    FROM relationship_edges
+                    WHERE conversation_id = ? AND source_user_id = ? AND target_user_id = ?
+                """, (str(gid), str(source_id), str(target_id))).fetchone()
+                reverse = db.execute("""
+                    SELECT interactions FROM relationship_edges
+                    WHERE conversation_id = ? AND source_user_id = ? AND target_user_id = ?
+                """, (str(gid), str(target_id), str(source_id))).fetchone()
+                interactions, pos, neg, help_count = row
+                reverse_count = reverse[0] if reverse else 0
+                familiarity = min(100.0, 100.0 * (1.0 - math.exp(-interactions / 12.0)))
+                warmth = max(0.0, min(100.0, 50.0 + 24.0 * math.tanh((pos + help_count - 1.4 * neg) / 4.0)))
+                reciprocity = (100.0 * min(interactions, reverse_count) / max(interactions, reverse_count)
+                               if reverse_count else 0.0)
+                tension = min(100.0, 100.0 * neg / max(1, pos + help_count + neg))
+                confidence = min(0.98, 1.0 - math.exp(-(interactions + reverse_count) / 10.0))
+                overall = max(0.0, min(100.0,
+                    0.34 * warmth + 0.24 * familiarity + 0.22 * reciprocity +
+                    0.20 * (100.0 - tension)
+                ))
+                db.execute("""
+                    UPDATE relationship_edges SET familiarity_score = ?, warmth_score = ?,
+                        reciprocity_score = ?, tension_score = ?, overall_score = ?, confidence = ?
+                    WHERE conversation_id = ? AND source_user_id = ? AND target_user_id = ?
+                """, (familiarity, warmth, reciprocity, tension, overall, confidence,
+                      str(gid), str(source_id), str(target_id)))
+                if reverse:
+                    db.execute("""
+                        UPDATE relationship_edges SET reciprocity_score = ?,
+                            overall_score = MAX(0, MIN(100,
+                                0.34 * warmth_score + 0.24 * familiarity_score +
+                                0.22 * ? + 0.20 * (100 - tension_score)
+                            )), confidence = ?
+                        WHERE conversation_id = ? AND source_user_id = ? AND target_user_id = ?
+                    """, (reciprocity, reciprocity, confidence, str(gid),
+                          str(target_id), str(source_id)))
+        except (OSError, sqlite3.Error) as error:
+            print(f"关系画像更新失败：{type(error).__name__}")
+
+    @staticmethod
+    def mentioned_user_ids(ev):
+        message = ev.get("message") or []
+        if not isinstance(message, list):
+            return []
+        return [str((segment.get("data") or {}).get("qq")) for segment in message
+                if isinstance(segment, dict) and str(segment.get("type")) == "at"
+                and str((segment.get("data") or {}).get("qq") or "") not in ("", "all")]
+
+    def user_profile(self, gid, user_id):
+        try:
+            with self.cache_db() as db:
+                row = db.execute("""
+                    SELECT current_name, message_count, char_count, question_count, sticker_count,
+                           quote_count, mention_count, positive_signals, negative_signals,
+                           helpful_signals, profile_summary, first_seen, last_seen
+                    FROM user_profiles WHERE conversation_id = ? AND user_id = ?
+                """, (str(gid), str(user_id))).fetchone()
+            if not row:
+                return None
+            keys = ("current_name", "message_count", "char_count", "question_count",
+                    "sticker_count", "quote_count", "mention_count", "positive_signals",
+                    "negative_signals", "helpful_signals", "profile_summary", "first_seen", "last_seen")
+            return dict(zip(keys, row))
+        except (OSError, sqlite3.Error):
+            return None
+
+    def relationship_profile(self, gid, source_id, target_id):
+        try:
+            with self.cache_db() as db:
+                row = db.execute("""
+                    SELECT interactions, replies, mentions, positive_signals, negative_signals,
+                           helpful_signals, familiarity_score, warmth_score, reciprocity_score,
+                           tension_score, overall_score, confidence, updated_at
+                    FROM relationship_edges
+                    WHERE conversation_id = ? AND source_user_id = ? AND target_user_id = ?
+                """, (str(gid), str(source_id), str(target_id))).fetchone()
+            if not row:
+                return None
+            keys = ("interactions", "replies", "mentions", "positive_signals", "negative_signals",
+                    "helpful_signals", "familiarity_score", "warmth_score", "reciprocity_score",
+                    "tension_score", "overall_score", "confidence", "updated_at")
+            return dict(zip(keys, row))
+        except (OSError, sqlite3.Error):
+            return None
 
     def wiki_cache_key(self, query):
         queries = self.wiki_queries(query)
@@ -1124,10 +1571,13 @@ class Bot:
         answer_text = re.sub(r"\s+", "", str(answer or "")).lower()
         if not answer_text:
             return True
+        knowledge_question = any(marker in raw_text for marker in (
+            "是什么", "为什么", "为何", "怎么", "多少", "多大", "能不能", "可以吗", "什么意思"
+        ))
         failure_markers = (
             "模型没有正常返回", "模型没正常返回", "没有生成出可靠答案", "稍后重发",
             "北洋维基这次没有成功打开", "北洋维基尚未连接", "北洋维基未连接",
-            "检索暂时失败", "响应卡了一下",
+            "检索暂时失败", "响应卡了一下", "暂无上下文", "没有上下文",
         )
         if any(marker in answer_text for marker in failure_markers):
             return True
@@ -1145,15 +1595,34 @@ class Bot:
                 marker in raw_text for marker in ("大小", "尺寸", "多大", "多长", "多宽")):
             if "190" not in answer_text or not any(value in answer_text for value in ("83.5", "85")):
                 return True
-        if school_question and any(marker in raw_text for marker in ("几人间", "几个人")):
+        if (school_question and "研究生" not in raw_text
+                and any(marker in raw_text for marker in ("几人间", "几个人"))):
             if not any(value in answer_text for value in ("四人间", "4人间", "四人寝", "4人寝")):
                 return True
         if (not school_question and not self.is_self_intro_request(raw)
                 and "维基" in answer_text and "维基" not in raw_text):
             return True
         if "量子纠缠" in raw_text and any(marker in answer_text for marker in (
-            "瞬间影响另一个", "立马影响另一个", "一个转另一个也跟着转", "不靠信号传递"
+            "瞬间影响另一个", "立马影响另一个", "一个转另一个也跟着转", "不靠信号传递",
+            "动一个另一个", "另一个立马跟着变", "另一个会瞬间跟着变"
         )):
+            return True
+        if "量子纠缠" in raw_text and not any(marker in answer_text for marker in (
+            "量子纠缠", "粒子", "量子态", "关联"
+        )):
+            return True
+        if knowledge_question and any(marker in answer_text for marker in (
+            "我也就懂个大概", "我不太懂", "没法解释清楚", "不是物理老师",
+            "去b站搜", "回头可以去b站", "自己搜点科普", "问问物理学院",
+            "这问题有点突然", "咱这群里聊", "你是想问我啥", "不在服务区",
+            "哪说过", "没说过", "记岔了", "要聊学校", "只懂天大"
+        )):
+            return True
+        if school_question and ("～" in answer_text or "~" in answer_text):
+            return True
+        if (school_question and "研究生" in raw_text
+                and any(marker in raw_text for marker in ("宿舍", "几人间", "四人间"))
+                and "https://wiki.tjubot.cn/" in answer_text and "/dorm/" not in answer_text):
             return True
         stale_school_terms = ("床铺", "床垫", "几人间", "宿舍", "北洋园", "卫津路")
         if (not school_question and not self.should_search_school_wiki(raw)
@@ -1173,9 +1642,6 @@ class Bot:
         )
         if any(marker in answer_text for marker in hard_ai_phrases):
             return True
-        knowledge_question = any(marker in raw_text for marker in (
-            "是什么", "为什么", "为何", "怎么", "多少", "多大", "能不能", "可以吗"
-        ))
         if knowledge_question and answer_text.startswith("哈哈"):
             return True
         availability_question = any(marker in raw_text for marker in (
@@ -1289,7 +1755,9 @@ class Bot:
                    "针对缺失信息的具体问题。回复必须紧扣最近消息里的具体事实。"
                    "但自我介绍、询问你是谁、功能说明、明确知识问题和完整指令本身就有足够信息，必须直接"
                    "完成，绝不能用“没有上下文”搪塞。整体风格要事实严谨、表达活泼、判断灵活；可以自然"
-                   "幽默，但不能油腻、装熟或牺牲准确性。对方如果吐槽、质疑甚至骂你，必须明确表示你"
+                   "幽默，但不能油腻、装熟或牺牲准确性。天大新生助手只是服务场景，不是知识范围限制；"
+                   "物理、编程、生活常识等完整问题也必须直接回答，不得说不在服务区、不是老师或赶用户另找人。"
+                   "对方如果吐槽、质疑甚至骂你，必须明确表示你"
                    "看见了，并针对他不满的具体原因自然回应；可以认错、解释或轻松接一句，但不能装没看见、"
                    "训斥对方或重复索要上下文。"
                    "说话要像群里一个正常同学，不写客服话术、产品介绍、公告或作文。直接回答当前问题后就停，"
@@ -1297,6 +1765,13 @@ class Bot:
                    "‘有问题随时问我’、‘尽管问’、‘想试哪个’之类收尾。少用‘当然’‘哈哈’‘此外’"
                    "‘总而言之’，不用‘不仅……而且……’的模板，不堆三个并列形容词，不滥用破折号、"
                    "波浪号和表情。句子长短可以变化，允许一点口语和个性，但不装熟、不谄媚。")
+        system += ("消息里的【引用 某人：内容】是用户明确回复的原消息，必须结合引用回答，不能只看引用后的短句。"
+                   "【QQ表情：名称】和【表情包：名称】是 NapCat 提供的语义标签，可以据此理解语气；"
+                   "【图片】或【表情包图片】没有可靠视觉描述，不能编造画面内容。若语境确实适合，可在正文末尾"
+                   "加一个发送标记：[表情:微笑]、[表情:呲牙]、[表情:偷笑]、[表情:可爱]、[表情:疑问]、"
+                   "[表情:赞]、[表情:鼓掌]、[表情:抱拳]、[表情:委屈]、[表情:流泪]、[表情:生气]、"
+                   "[表情:再见]、[表情:爱心]、[表情:胜利]或[表情:白眼]。收到商城表情包时还可用"
+                   "[表情:回同款]。标记最多一个，通常不要加，严肃事实回答和对方不满时不要加。")
         if self.is_history_question(raw):
             system += ("用户正在追问历史对话。系统提供的最近群聊和24小时缓存是真实可读记录，必须先查记录再答。"
                        "时间戳只能证明何时发过消息，不能证明睡眠、动机或因果。记录只显示用户做了什么、"
@@ -1375,15 +1850,16 @@ class Bot:
                 if wiki_context:
                     final_system += "涉及学校事实时只能依据随问题提供的资料，不得用泛化常识替代精确数据。"
                     final_prompt += f"\n相关学校资料：\n{wiki_context}"
-                final_answer = await asyncio.to_thread(
-                    self.llm_chat, clean_lm, final_system, final_prompt, 220
-                )
-                if final_answer and not self.response_is_bad(
-                    raw, final_answer, school_question=bool(wiki_query)
-                ):
-                    result = final_answer
-                else:
-                    result = None
+                result = None
+                for _ in range(2):
+                    final_answer = await asyncio.to_thread(
+                        self.llm_chat, clean_lm, final_system, final_prompt, 220
+                    )
+                    if final_answer and not self.response_is_bad(
+                        raw, final_answer, school_question=bool(wiki_query)
+                    ):
+                        result = final_answer
+                        break
         if not result and wiki_context:
             fallback = self.wiki_fallback_answer(wiki_context)
             if fallback:
@@ -1447,9 +1923,77 @@ class Bot:
         values = groups.get("allow") if isinstance(groups, dict) else groups
         return [int(value) for value in norm_list(values) if str(value).isdigit()]
 
+    def save_group_stats(self, gid, member_count, max_member_count=0, group_name=""):
+        counts = self.cache_message_counts(gid)
+        active_24h = len(counts)
+        message_24h = sum(row[2] for row in counts)
+        try:
+            with self.cache_db() as db:
+                db.execute("""
+                    INSERT INTO group_stats (
+                        group_id, group_name, member_count, max_member_count,
+                        active_24h, message_24h, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(group_id) DO UPDATE SET
+                        group_name = excluded.group_name,
+                        member_count = excluded.member_count,
+                        max_member_count = excluded.max_member_count,
+                        active_24h = excluded.active_24h,
+                        message_24h = excluded.message_24h,
+                        updated_at = excluded.updated_at
+                """, (str(gid), str(group_name or ""), int(member_count or 0),
+                      int(max_member_count or 0), active_24h, message_24h, time.time()))
+            return True
+        except (OSError, sqlite3.Error) as error:
+            print(f"群人数统计写入失败：{type(error).__name__}")
+            return False
+
+    def group_stats(self, gid):
+        try:
+            with self.cache_db() as db:
+                row = db.execute("""
+                    SELECT group_name, member_count, max_member_count, active_24h,
+                           message_24h, updated_at
+                    FROM group_stats WHERE group_id = ?
+                """, (str(gid),)).fetchone()
+            if not row:
+                return None
+            keys = ("group_name", "member_count", "max_member_count", "active_24h",
+                    "message_24h", "updated_at")
+            return dict(zip(keys, row))
+        except (OSError, sqlite3.Error):
+            return None
+
+    async def refresh_group_stats(self, ws, gid):
+        data = await self.call_onebot(ws, "get_group_info", {"group_id": int(gid), "no_cache": True})
+        if not isinstance(data, dict):
+            return False
+        return self.save_group_stats(
+            gid, data.get("member_count") or 0, data.get("max_member_count") or 0,
+            data.get("group_name") or "",
+        )
+
+    def group_stats_answer(self, gid, text):
+        normalized = re.sub(r"\s+", "", str(text or ""))
+        if not any(marker in normalized for marker in (
+            "群里多少人", "群人数", "群成员数", "群里几个人", "本群人数", "活跃人数"
+        )):
+            return None
+        stats = self.group_stats(gid)
+        if not stats:
+            return "群人数还没同步完成。"
+        updated = time.strftime("%m-%d %H:%M", time.localtime(stats["updated_at"]))
+        return (f"当前群成员 {stats['member_count']} 人，近 {self.cache_hours()} 小时有 "
+                f"{stats['active_24h']} 人发言，共 {stats['message_24h']} 条消息。"
+                f"人数更新时间：{updated}。")
+
     def daily_summary_chunks(self, gid, max_chars=2600):
         counts = self.cache_message_counts(gid)
         header = f"近 {self.cache_hours()} 小时群聊发言统计（截至 {time.strftime('%m-%d %H:%M')}）"
+        stats = self.group_stats(gid)
+        if stats:
+            header += (f"\n群成员 {stats['member_count']} 人；近 {self.cache_hours()} 小时活跃 "
+                       f"{stats['active_24h']} 人，共 {stats['message_24h']} 条消息。")
         lines = [f"{index}. {name}：{count} 条" for index, (_, name, count) in enumerate(counts, start=1)]
         if not lines:
             return [header + "\n暂无群友发言。"]
@@ -1470,6 +2014,7 @@ class Bot:
         state_key = f"daily-summary:{gid}"
         if self.cache_meta_get(state_key) == today:
             return False
+        await self.refresh_group_stats(ws, gid)
         for chunk in self.daily_summary_chunks(gid):
             await self.send(ws, gid, chunk)
             self.remember_sent(gid, chunk)
@@ -1486,6 +2031,72 @@ class Bot:
         self.add_bot_history(gid, text)
 
     # ---------- 发送 ----------
+    async def call_onebot(self, ws, action, params=None, timeout=8):
+        echo = f"bot-{time.time_ns()}-{random.randint(1000, 9999)}"
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self.api_waiters[echo] = future
+        try:
+            await ws.send(json.dumps({"action": action, "params": params or {}, "echo": echo},
+                                     ensure_ascii=False))
+            response = await asyncio.wait_for(future, timeout=timeout)
+            if response.get("status") == "ok" and response.get("retcode", 0) == 0:
+                return response.get("data")
+            return None
+        except (asyncio.TimeoutError, OSError):
+            return None
+        finally:
+            self.api_waiters.pop(echo, None)
+
+    async def quoted_context(self, ws, ev):
+        reply_id = self.reply_message_id(ev)
+        if not reply_id:
+            return None, None, None
+        data = await self.call_onebot(ws, "get_msg", {"message_id": int(reply_id)}, timeout=6)
+        if not isinstance(data, dict):
+            return None, reply_id, None
+        quoted_text = self.norm_text(data) or "【非文本消息】"
+        quoted_name = self.user_name(data) or str(data.get("user_id") or "对方")
+        quoted_user_id = data.get("user_id") or (data.get("sender") or {}).get("user_id")
+        return f"【引用 {quoted_name}：{quoted_text}】", reply_id, quoted_user_id
+
+    @classmethod
+    def outgoing_message(cls, reply, ev=None, quote_current=False, allow_reactions=True):
+        if isinstance(reply, list):
+            segments = [dict(segment) for segment in reply]
+            text = "".join(
+                str((segment.get("data") or {}).get("text") or "")
+                for segment in segments if str(segment.get("type")) == "text"
+            )
+        else:
+            text = str(reply or "")
+            segments = []
+        reaction = None
+        marker = re.search(r"\[表情[:：]([^\]]+)\]", text)
+        if marker:
+            reaction = marker.group(1).strip()
+            text = (text[:marker.start()] + text[marker.end():]).strip()
+        if not allow_reactions:
+            reaction = None
+        if isinstance(reply, list):
+            for segment in segments:
+                if str(segment.get("type")) == "text":
+                    value = str((segment.get("data") or {}).get("text") or "")
+                    segment.setdefault("data", {})["text"] = re.sub(
+                        r"\s*\[表情[:：][^\]]+\]\s*", "", value
+                    ).strip()
+        else:
+            segments = [{"type": "text", "data": {"text": text}}] if text else []
+        if quote_current and ev and ev.get("message_id") is not None:
+            segments.insert(0, {"type": "reply", "data": {"id": str(ev.get("message_id"))}})
+        if reaction == "回同款" and ev:
+            sticker = cls.incoming_sticker_segment(ev)
+            if sticker:
+                segments.append(sticker)
+        elif reaction in cls.SEND_FACE_IDS:
+            segments.append({"type": "face", "data": {"id": cls.SEND_FACE_IDS[reaction]}})
+        return segments if any(str(segment.get("type")) != "text" for segment in segments) else text
+
     @staticmethod
     async def send(ws, gid, message):
         target = str(gid)
@@ -1685,7 +2296,7 @@ class Bot:
             group_id = ev.get("group_id")
             uid = ev.get("user_id")
             is_private = ev.get("message_type") == "private" or group_id is None
-            raw = self.norm_text(ev)
+            plain_raw = self.norm_text(ev)
             if ev.get("self_id") and str(uid) == str(ev.get("self_id")):
                 return
             if is_private:
@@ -1697,12 +2308,19 @@ class Bot:
                     return
                 self.groups_seen.add(group_id)
                 gid = group_id
-            if self.is_banned(raw):
+            if self.is_banned(plain_raw):
                 return
             name = self.user_name(ev)
+            if self.message_features_cfg().get("resolve_replies", True):
+                quoted, reply_id, quoted_user_id = await self.quoted_context(ws, ev)
+            else:
+                quoted, reply_id, quoted_user_id = None, self.reply_message_id(ev), None
+            raw = f"{quoted}\n{plain_raw}".strip() if quoted else plain_raw
             self.add_history(gid, name, raw, user_id=uid)
             mentioned = is_private
             self_id = str(ev.get("self_id") or "")
+            if quoted_user_id is not None and str(quoted_user_id) == self_id:
+                mentioned = True
             message = ev.get("message") or []
             if isinstance(message, list):
                 mentioned = mentioned or any(
@@ -1715,7 +2333,21 @@ class Bot:
             for n in (self.nickname, self.name):
                 if n and n in raw:
                     mentioned = True
-            if await self.handle_game_message(ws, gid, uid, raw, mentioned):
+            if self.profiling_cfg().get("enabled", True):
+                self.update_user_profile(gid, uid, name, plain_raw, ev, quoted=bool(reply_id))
+                mentioned_ids = set(self.mentioned_user_ids(ev))
+                relationship_targets = set(mentioned_ids)
+                if quoted_user_id is not None:
+                    relationship_targets.add(str(quoted_user_id))
+                if mentioned and self_id:
+                    relationship_targets.add(self_id)
+                for target_id in relationship_targets:
+                    self.update_relationship(
+                        gid, uid, target_id, plain_raw,
+                        replied=bool(quoted_user_id is not None and str(quoted_user_id) == str(target_id)),
+                        mentioned=target_id in mentioned_ids,
+                    )
+            if await self.handle_game_message(ws, gid, uid, plain_raw, mentioned):
                 return
             if not mentioned:
                 if not self.topic_is_active(gid):
@@ -1727,7 +2359,9 @@ class Bot:
                 return
             reply = None
             decision = None
-            public_answer = self.public_answer_for(raw) if mentioned else None
+            public_answer = None
+            if mentioned and not quoted:
+                public_answer = self.group_stats_answer(gid, plain_raw) or self.public_answer_for(plain_raw)
             if public_answer:
                 reply = self.render(public_answer, name, uid, raw)
             elif self.llm_ready():
@@ -1750,8 +2384,17 @@ class Bot:
             if reply is not None:
                 print(f"[{time.strftime('%H:%M:%S')}] 接话 {uid}: {raw} ->"
                       + (reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)))
-                await self.send(ws, gid, reply)
-                self.remember_sent(gid, reply if isinstance(reply, str) else "[at] " + str(reply))
+                outgoing = self.outgoing_message(
+                    reply, ev,
+                    quote_current=bool(
+                        self.message_features_cfg().get("quote_group_replies", True)
+                        and not is_private and (mentioned or reply_id)
+                    ),
+                    allow_reactions=self.message_features_cfg().get("send_faces", True),
+                )
+                await self.send(ws, gid, outgoing)
+                sent_text = self.norm_text({"message": outgoing}) if isinstance(outgoing, list) else str(outgoing)
+                self.remember_sent(gid, sent_text)
         except Exception as error:
             print(f"[{time.strftime('%H:%M:%S')}] 接话处理出错：{type(error).__name__}: {error}")
             if mentioned and gid is not None:
@@ -1836,6 +2479,15 @@ class Bot:
                         print(f"每日发言统计发送失败：{type(error).__name__}")
             await asyncio.sleep(15)
 
+    async def group_stats_loop(self, ws):
+        while True:
+            for gid in self.configured_group_ids():
+                try:
+                    await self.refresh_group_stats(ws, gid)
+                except Exception as error:
+                    print(f"群人数同步失败：{type(error).__name__}")
+            await asyncio.sleep(1800)
+
     # ---------- 入群欢迎 ----------
     async def on_notice(self, ws, ev):
         if ev.get("post_type") != "notice":
@@ -1847,6 +2499,11 @@ class Bot:
             if gid and uid and new_name and self.in_groups(gid):
                 self.cache_update_name(gid, uid, new_name)
                 print(f"[{time.strftime('%H:%M:%S')}] 已更新群名片索引 {uid}: {new_name}")
+            return
+        if ev.get("notice_type") in ("group_increase", "group_decrease"):
+            gid = ev.get("group_id")
+            if gid and self.in_groups(gid):
+                await self.refresh_group_stats(ws, gid)
             return
         if ev.get("notice_type") == "notify" and ev.get("sub_type") == "poke":
             gid = ev.get("group_id")
@@ -1894,6 +2551,7 @@ class Bot:
                     tasks = [
                         asyncio.create_task(self.proactive_loop(ws)),
                         asyncio.create_task(self.scheduler_loop(ws)),
+                        asyncio.create_task(self.group_stats_loop(ws)),
                     ]
                     async for raw in ws:
                         if not raw:
@@ -1901,6 +2559,12 @@ class Bot:
                         try:
                             ev = json.loads(raw)
                         except json.JSONDecodeError:
+                            continue
+                        echo = ev.get("echo")
+                        if echo is not None and str(echo) in self.api_waiters:
+                            future = self.api_waiters.get(str(echo))
+                            if future and not future.done():
+                                future.set_result(ev)
                             continue
                         if (ev.get("post_type") == "message" and
                                 ev.get("message_type") in ("group", "private")):
