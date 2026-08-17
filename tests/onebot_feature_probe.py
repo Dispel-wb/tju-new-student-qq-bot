@@ -14,6 +14,7 @@ SOURCE_DIR = PROJECT_DIR / "src" if (PROJECT_DIR / "src" / "bot.py").exists() el
 sys.path.insert(0, str(SOURCE_DIR))
 
 from bot import Bot
+from onebot_endpoint import discover_open_endpoint
 
 
 async def pump(bot, websocket):
@@ -28,7 +29,10 @@ async def pump(bot, websocket):
 async def main():
     with tempfile.TemporaryDirectory() as cache_dir:
         bot = Bot(SOURCE_DIR / "bot.md", cache_path=Path(cache_dir) / "probe.sqlite3")
-        async with websockets.connect(bot.ws_url, ping_interval=20, ping_timeout=20) as websocket:
+        ws_url = discover_open_endpoint(bot.configured_ws_url, base_dir=SOURCE_DIR)
+        if not ws_url:
+            raise RuntimeError("没有从 NapCat 配置发现可连接的 OneBot WebSocket")
+        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as websocket:
             receiver = asyncio.create_task(pump(bot, websocket))
             try:
                 group = await bot.call_onebot(

@@ -9,7 +9,7 @@
     pip install -r requirements.txt
     python bot.py             # 连接 NapCat，开始自动水群
     python bot.py --check     # 只校验 bot.md（无需连接）
-    BOT_WS_URL=ws://127.0.0.1:3002 python bot.py   # 自定义连接地址
+    BOT_WS_URL=ws://主机:端口 python bot.py   # 可选：显式覆盖自动发现
 """
 import asyncio
 import json
@@ -29,6 +29,8 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 
+from onebot_endpoint import endpoint_candidates
+
 def _fix_console():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -47,7 +49,7 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
     BASE_DIR = Path(__file__).resolve().parent
-WS_URL = os.environ.get('BOT_WS_URL', 'ws://127.0.0.1:3002')
+WS_URL = os.environ.get('BOT_WS_URL', 'auto')
 DEFAULT_MD = BASE_DIR / 'bot.md'
 SEC_KEYS = {
     "人设": "persona", "persona": "persona",
@@ -316,7 +318,8 @@ class Bot:
         self.name = ""
         self.nickname = ""
         self.prefix = ""
-        self.ws_url = WS_URL
+        self.configured_ws_url = WS_URL
+        self.ws_url = "auto"
         self.groups_seen = set()
         self.last_reply = defaultdict(float)
         self.history = defaultdict(lambda: deque(maxlen=80))
@@ -354,7 +357,9 @@ class Bot:
         self.name = str(cfg.get("name") or "水群机")
         self.nickname = str(cfg.get("nickname") or "")
         self.prefix = str(cfg.get("command_prefix") or "")
-        self.ws_url = os.environ.get("BOT_WS_URL", str(cfg.get("ws_url") or WS_URL))
+        self.configured_ws_url = os.environ.get("BOT_WS_URL", str(cfg.get("ws_url") or WS_URL))
+        candidates = self.onebot_urls()
+        self.ws_url = candidates[0] if candidates else "auto"
         try:
             self._file_mtime = self.md_path.stat().st_mtime
         except OSError:
@@ -369,6 +374,18 @@ class Bot:
                 print(f"[{time.strftime('%H:%M:%S')}] bot.md 已变更，热重载完成")
         except OSError:
             pass
+
+    def onebot_urls(self):
+        configured_dir = os.environ.get(
+            "BOT_ONEBOT_CONFIG_DIR",
+            str(self.cfg.get("onebot_config_dir") or ""),
+        ).strip()
+        config_dirs = [Path(configured_dir).expanduser()] if configured_dir else None
+        return endpoint_candidates(
+            self.configured_ws_url,
+            config_dirs=config_dirs,
+            base_dir=BASE_DIR,
+        )
 
     # ---------- 工具 ----------
     @staticmethod
@@ -2543,41 +2560,53 @@ class Bot:
             print("未安装 websockets：请先运行 pip install -r requirements.txt")
             return
         while True:
-            try:
-                async with websockets.connect(
-                        self.ws_url, ping_interval=20, ping_timeout=20,
-                        max_size=16 * 1024 * 1024) as ws:
-                    print(f"[{time.strftime('%H:%M:%S')}] 已连接 {self.ws_url}，开始自动水群")
-                    tasks = [
-                        asyncio.create_task(self.proactive_loop(ws)),
-                        asyncio.create_task(self.scheduler_loop(ws)),
-                        asyncio.create_task(self.group_stats_loop(ws)),
-                    ]
-                    async for raw in ws:
-                        if not raw:
-                            continue
-                        try:
-                            ev = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        echo = ev.get("echo")
-                        if echo is not None and str(echo) in self.api_waiters:
-                            future = self.api_waiters.get(str(echo))
-                            if future and not future.done():
-                                future.set_result(ev)
-                            continue
-                        if (ev.get("post_type") == "message" and
-                                ev.get("message_type") in ("group", "private")):
-                            asyncio.create_task(self.dispatch_message(ws, ev))
-                        else:
-                            asyncio.create_task(self.on_notice(ws, ev))
-                    for t in tasks:
-                        t.cancel()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"[{time.strftime('%H:%M:%S')}] 连接断开/失败：{e} → 5 秒后重连")
+            urls = self.onebot_urls()
+            if not urls:
+                print(f"[{time.strftime('%H:%M:%S')}] 未从 NapCat 配置发现启用的 OneBot WebSocket，5 秒后重新检测")
                 await asyncio.sleep(5)
+                continue
+            for url in urls:
+                tasks = []
+                try:
+                    self.ws_url = url
+                    async with websockets.connect(
+                            url, ping_interval=20, ping_timeout=20,
+                            max_size=16 * 1024 * 1024) as ws:
+                        print(f"[{time.strftime('%H:%M:%S')}] 已连接自动发现的 OneBot 端点 {url}")
+                        tasks = [
+                            asyncio.create_task(self.proactive_loop(ws)),
+                            asyncio.create_task(self.scheduler_loop(ws)),
+                            asyncio.create_task(self.group_stats_loop(ws)),
+                        ]
+                        async for raw in ws:
+                            if not raw:
+                                continue
+                            try:
+                                ev = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            echo = ev.get("echo")
+                            if echo is not None and str(echo) in self.api_waiters:
+                                future = self.api_waiters.get(str(echo))
+                                if future and not future.done():
+                                    future.set_result(ev)
+                                continue
+                            if (ev.get("post_type") == "message" and
+                                    ev.get("message_type") in ("group", "private")):
+                                asyncio.create_task(self.dispatch_message(ws, ev))
+                            else:
+                                asyncio.create_task(self.on_notice(ws, ev))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    print(f"[{time.strftime('%H:%M:%S')}] OneBot 端点 {url} 不可用：{error}")
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+            print(f"[{time.strftime('%H:%M:%S')}] 所有自动发现的 OneBot 端点均不可用，5 秒后重新读取配置")
+            await asyncio.sleep(5)
 
     # ---------- 检查模式 ----------
     def print_summary(self):

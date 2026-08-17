@@ -9,9 +9,5 @@ data/
 protocol/
 onebot11_*.json
 *.desktop
-run-bot.sh
-start-all.sh
-start-napcat.sh
-stop-napcat.sh
 .pytest_cache/
 .coverage

@@ -13,7 +13,7 @@ daily_summary_time: 23:00
 active_topic_window: 300
 active_topic_messages: 3
 topic_interval_min: 7200
-ws_url: ws://127.0.0.1:3002
+ws_url: auto
 groups:
   allow:
     - 1057604880
